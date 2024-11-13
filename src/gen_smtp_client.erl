@@ -277,46 +277,28 @@ close(#smtp_client_socket{socket = Socket}) ->
     quit(Socket).
 
 -spec send_it(Email :: email(), Options :: options()) ->
-    binary()
-    | smtp_session_error().
+          binary()
+              | smtp_session_error().
 send_it(Email, Options) ->
     NoMXLookups = proplists:get_value(no_mx_lookups, Options, false),
-    Relay = case proplists:get_value(relay, Options) of
-                <<Domain/binary>> when NoMXLookups =:= 'true' ->
-                    %% maybe we're supposed to relay to a host directly
-                    [{to_string(Domain), [{0, to_string(Domain)}]}];
-                <<Domain/binary>> ->
-                    [{to_string(Domain), smtp_util:mxlookup(to_string(Domain))}];
-                [<<_/binary>> | _ ] = Domains when NoMXLookups =:= 'true' ->
-                    %% maybe we're supposed to relay to a host directly
-                    [{to_string(Domain), {0, to_string(Domain)}} || Domain <- Domains];
-                [<<_/binary>> | _ ] = Domains ->
-                    [{to_string(Domain), smtp_util:mxlookup(to_string(Domain))} || Domain <- Domains];
-                [List | _ ] = Domains when is_list(List) andalso NoMXLookups =:= 'true' ->
-                    %% maybe we're supposed to relay to a host directly
-                    [{Domain, [{0, Domain}]} || Domain <- Domains];
-                [List | _ ] = Domains when is_list(List) ->
-                    [{Domain, smtp_util:mxlookup(Domain)} || Domain <- Domains];
-                Domain when NoMXLookups =:= 'true' ->
-                    %% maybe we're supposed to relay to a host directly
-                    [{Domain, [{0, Domain}]}];
-                Domain ->
-                    [{Domain, smtp_util:mxlookup(Domain)}]
-            end,
-	[?TRACE(Options, "MX records for ~s are ~p~n", [RelayDomain, MXRecords])
-      || {RelayDomain, MXRecords} <- Relay
+    Domain = proplists:get_value(relay, Options),
+    Relay = get_mx_records(Domain, NoMXLookups, Options),
+
+    [?TRACE(Options, "MX records for ~s are ~p~n", [RelayDomain, MXRecords])
+     || {RelayDomain, MXRecords} <- Relay
     ],
+
     Hosts = lists:flatmap(fun({_, MXRecords}) -> MXRecords end, Relay),
     case try_smtp_sessions(Hosts, Options, []) of
         {error, _, _} = Error ->
             Error;
         {ok, ClientSocket} ->
             #smtp_client_socket{
-                socket = Socket,
-                host = Host,
-                extensions = Extensions,
-                options = Options1
-            } = ClientSocket,
+               socket = Socket,
+               host = Host,
+               extensions = Extensions,
+               options = Options1
+              } = ClientSocket,
             try
                 try_sending_it(Email, Socket, Extensions, Options1)
             catch
@@ -327,11 +309,34 @@ send_it(Email, Options) ->
             end
     end.
 
+get_mx_records(<<Domain/binary>>, 'true', Options) ->
+    %% maybe we're supposed to relay to a host directly
+    ?TRACE(Options, "relaying directly to host ~s~n", [Domain]),
+    [{to_string(Domain), [{0, to_string(Domain)}]}];
+get_mx_records(<<Domain/binary>>, 'false', Options) ->
+    ?TRACE(Options, "mx lookup on ~s: ~p~n", [Domain, smtp_util:mxlookup(to_string(Domain))]),
+    [{to_string(Domain), smtp_util:mxlookup(to_string(Domain))}];
+get_mx_records([<<_/binary>> | _ ] = Domains, 'true', _Options) ->
+    %% maybe we're supposed to relay to a host directly
+    [{to_string(Domain), {0, to_string(Domain)}} || Domain <- Domains];
+get_mx_records([<<_/binary>> | _ ] = Domains, 'false', _Options) ->
+    [{to_string(Domain), smtp_util:mxlookup(to_string(Domain))} || Domain <- Domains];
+get_mx_records([List | _ ] = Domains, 'true', _Options) when is_list(List) ->
+    %% maybe we're supposed to relay to a host directly
+    [{Domain, [{0, Domain}]} || Domain <- Domains];
+get_mx_records([List | _ ] = Domains, 'false', _Options) when is_list(List) ->
+    [{Domain, smtp_util:mxlookup(Domain)} || Domain <- Domains];
+get_mx_records(Domain, 'true', _Options) ->
+    %% maybe we're supposed to relay to a host directly
+    [{Domain, [{0, Domain}]}];
+get_mx_records(Domain, 'false', _Options) ->
+    [{Domain, smtp_util:mxlookup(Domain)}].
+
 -spec try_smtp_sessions(
-    Hosts :: [{non_neg_integer(), string()}, ...], Options :: options(), RetryList :: list()
-) ->
-    {ok, smtp_client_socket()}
-    | smtp_session_error().
+        Hosts :: [{non_neg_integer(), string()}, ...], Options :: options(), RetryList :: list()
+       ) ->
+          {ok, smtp_client_socket()}
+              | smtp_session_error().
 try_smtp_sessions([{_Distance, Host} | _Tail] = Hosts, Options, RetryList) ->
     try
         {ok, open_smtp_session(Host, Options)}
@@ -671,10 +676,10 @@ do_AUTH_each(Socket, Username, Password, ["CRAM-MD5" | Tail], Options) ->
             smtp_socket:send(Socket, [String, "\r\n"]),
             case read_possible_multiline_reply(Socket) of
                 {ok, <<"235", _Rest/binary>>} ->
-                    ?TRACE(Options, "authentication accepted~n", []),
+                    ?TRACE(Options, "CRAM-MD5 authentication accepted~n", []),
                     true;
                 {ok, Msg} ->
-                    ?TRACE(Options, "authentication rejected: ~s~n", [Msg]),
+                    ?TRACE(Options, "CRAM-mD5 authentication rejected: ~s~n", [Msg]),
                     do_AUTH_each(Socket, Username, Password, Tail, Options)
             end;
         {ok, Something} ->
@@ -686,13 +691,17 @@ do_AUTH_each(Socket, Username, Password, ["XOAUTH2" | Tail], Options) ->
     smtp_socket:send(Socket, ["AUTH XOAUTH2 ", Str, "\r\n"]),
     case read_possible_multiline_reply(Socket) of
         {ok, <<"235", _Rest/binary>>} ->
+            ?TRACE(Options, "XOAUTH2 authentication accepted~n", []),
             true;
         {ok, _Msg} ->
             do_AUTH_each(Socket, Username, Password, Tail, Options)
     end;
 do_AUTH_each(Socket, Username, Password, ["LOGIN" | Tail], Options) ->
+    ?TRACE(Options, "trying AUTH LOGIN: ~p~n", [Socket]),
     smtp_socket:send(Socket, "AUTH LOGIN\r\n"),
-    {ok, Prompt} = read_possible_multiline_reply(Socket),
+    Return = read_possible_multiline_reply(Socket, Options),
+    ?TRACE(Options, "AUTH LOGIN prompt return: ~p~n", [Return]),
+    {ok, Prompt} = Return,
     case is_auth_username_prompt(Prompt) of
         true ->
             %% base64 Username: or username:
@@ -719,19 +728,20 @@ do_AUTH_each(Socket, Username, Password, ["LOGIN" | Tail], Options) ->
                     do_AUTH_each(Socket, Username, Password, Tail, Options)
             end;
         false ->
-            ?TRACE(Options, "got ~s~n", [Prompt]),
+            ?TRACE(Options, "not an auth login prompt, got ~s~n", [Prompt]),
             do_AUTH_each(Socket, Username, Password, Tail, Options)
     end;
 do_AUTH_each(Socket, Username, Password, ["PLAIN" | Tail], Options) ->
+    ?TRACE(Options, "trying AUTH PLAIN~n", []),
     AuthString = base64:encode(<<0, Username/binary, 0, Password/binary>>),
     smtp_socket:send(Socket, ["AUTH PLAIN ", AuthString, "\r\n"]),
     case read_possible_multiline_reply(Socket) of
         {ok, <<"235", _Rest/binary>>} ->
-            ?TRACE(Options, "authentication accepted~n", []),
+            ?TRACE(Options, "PLAIN authentication accepted~n", []),
             true;
         Else ->
-            % TODO do we need to bother trying the multi-step PLAIN?
-            ?TRACE(Options, "authentication rejected ~p~n", [Else]),
+                                                % TODO do we need to bother trying the multi-step PLAIN?
+            ?TRACE(Options, "PLAIN authentication rejected ~p~n", [Else]),
             do_AUTH_each(Socket, Username, Password, Tail, Options)
     end;
 do_AUTH_each(Socket, Username, Password, [Type | Tail], Options) ->
@@ -803,6 +813,9 @@ try_STARTTLS(Socket, Options, Extensions) ->
                 {false, if_available} ->
                     ?TRACE(Options, "TLS failed~n", []),
                     {Socket, Extensions};
+                {true, _} ->
+                    ?TRACE(Options, "TLS already started~n", []),
+                    {Socket, Extensions};
                 {{S, E}, _} ->
                     ?TRACE(Options, "TLS started~n", []),
                     {S, E}
@@ -844,8 +857,8 @@ do_STARTTLS(Socket, Options) ->
                     error_logger:error_msg("SSL not started.~n"),
                     erlang:throw({permanent_failure, ssl_not_started});
                 {error, already_ssl} ->
-                    {ok, Extensions} = try_EHLO(Socket, Options),
-                    {Socket, Extensions};
+                    ?TRACE(Options, "already SSL", []),
+                    true;
                 Else ->
                     ?TRACE(Options, "~p~n", [Else]),
                     false
@@ -889,6 +902,7 @@ connect(Host, Options) ->
             undefined -> 5000;
             OTimeout -> OTimeout
         end,
+        ?TRACE(Options, "connect to ~s://~s:~p~n", [Proto, Host, Port]),
     case smtp_socket:connect(Proto, Host, Port, SockOpts, Timeout) of
         {ok, Socket} ->
             case read_possible_multiline_reply(Socket) of
@@ -908,6 +922,9 @@ connect(Host, Options) ->
 %% read a multiline reply (eg. EHLO reply)
 -spec read_possible_multiline_reply(Socket :: smtp_socket:socket()) -> {ok, binary()}.
 read_possible_multiline_reply(Socket) ->
+    read_possible_multiline_reply(Socket, 'undefined').
+
+read_possible_multiline_reply(Socket, Options) ->
     case smtp_socket:recv(Socket, 0, ?TIMEOUT) of
         {ok, Packet} ->
             case binstr:substr(Packet, 4, 1) of
@@ -917,12 +934,15 @@ read_possible_multiline_reply(Socket) ->
                 <<" ">> ->
                     {ok, Packet}
             end;
+        Error when Options =:= undefined ->
+            throw({network_failure, Error});
         Error ->
+            ?TRACE(Options, "failed to recv packet: ~p~n", [Error]),
             throw({network_failure, Error})
     end.
 
 -spec read_multiline_reply(Socket :: smtp_socket:socket(), Code :: binary(), Acc :: [binary()]) ->
-    {ok, binary()}.
+          {ok, binary()}.
 read_multiline_reply(Socket, Code, Acc) ->
     case smtp_socket:recv(Socket, 0, ?TIMEOUT) of
         {ok, Packet} ->
@@ -936,6 +956,7 @@ read_multiline_reply(Socket, Code, Acc) ->
                     throw({unexpected_response, lists:reverse([Packet | Acc])})
             end;
         Error ->
+        io:format("~p: network failure: ~p~n", [?LINE, Error]),
             throw({network_failure, Error})
     end.
 
